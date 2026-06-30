@@ -1,0 +1,987 @@
+[
+  {
+    "name": "BeautyDesk - Appointment Availability Check",
+    "active": false,
+    "settings": {
+      "executionOrder": "v1",
+      "saveDataErrorExecution": "all",
+      "saveDataSuccessExecution": "none",
+      "saveManualExecutions": true
+    },
+    "nodes": [
+      {
+        "id": "1",
+        "name": "Webhook",
+        "type": "n8n-nodes-base.webhook",
+        "typeVersion": 2,
+        "position": [
+          240,
+          300
+        ],
+        "parameters": {
+          "httpMethod": "POST",
+          "path": "appointment-enquiry",
+          "responseMode": "responseNode",
+          "authentication": "headerAuth"
+        }
+      },
+      {
+        "id": "2",
+        "name": "Validate Input",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          500,
+          300
+        ],
+        "parameters": {
+          "jsCode": "const payload = $json;\nconst errors = [];\n\nif (!payload.salonId) errors.push('salonId is required');\nif (!payload.requestedDate || !/^\\d{4}-\\d{2}-\\d{2}$/.test(payload.requestedDate)) errors.push('requestedDate must be YYYY-MM-DD');\nif (!payload.requestedTime || !/^\\d{2}:\\d{2}$/.test(payload.requestedTime)) errors.push('requestedTime must be HH:mm');\nif (!Number.isFinite(Number(payload.durationMinutes)) || Number(payload.durationMinutes) <= 0) errors.push('durationMinutes must be a positive number');\n\nconst requestedDateTime = new Date(`${payload.requestedDate}T${payload.requestedTime}:00`);\nif (Number.isNaN(requestedDateTime.getTime())) errors.push('requestedDate/requestedTime are invalid');\nif (!Number.isNaN(requestedDateTime.getTime()) && requestedDateTime < new Date()) errors.push('Requested slot is in the past');\n\nreturn [{ json: { ...payload, isValid: errors.length === 0, validationErrors: errors } }];"
+        }
+      },
+      {
+        "id": "3",
+        "name": "IF Valid?",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2,
+        "position": [
+          740,
+          300
+        ],
+        "parameters": {
+          "conditions": {
+            "boolean": [
+              {
+                "value1": "={{$json.isValid}}",
+                "operation": "true"
+              }
+            ]
+          }
+        }
+      },
+      {
+        "id": "4",
+        "name": "Respond 400",
+        "type": "n8n-nodes-base.respondToWebhook",
+        "typeVersion": 1,
+        "position": [
+          980,
+          480
+        ],
+        "parameters": {
+          "respondWith": "json",
+          "responseBody": "={{ { error: 'Invalid request payload', details: $json.validationErrors } }}",
+          "options": {
+            "responseCode": 400
+          }
+        }
+      },
+      {
+        "id": "5",
+        "name": "Resolve Salon Config",
+        "type": "n8n-nodes-base.postgres",
+        "typeVersion": 2.6,
+        "position": [
+          980,
+          220
+        ],
+        "parameters": {
+          "operation": "executeQuery",
+          "query": "SELECT salon_id, google_calendar_id AS \"calendarId\", timezone, buffer_minutes AS \"bufferMinutes\", calendar_status AS \"calendarStatus\"\nFROM salon_config\nWHERE salon_id = $1\nLIMIT 1;",
+          "options": {
+            "queryReplacement": "={{[$json.salonId]}}"
+          }
+        },
+        "credentials": {
+          "postgres": {
+            "id": "REPLACE_POSTGRES_CREDENTIAL_ID",
+            "name": "BeautyDesk Postgres"
+          }
+        }
+      },
+      {
+        "id": "6",
+        "name": "Compute Requested Window",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          1220,
+          220
+        ],
+        "parameters": {
+          "jsCode": "const source = $json;\nif (!source.calendarId || !source.timezone) {\n  throw new Error('Salon config not found or incomplete');\n}\n\nif (source.calendarStatus && source.calendarStatus === 'disconnected') {\n  return [{\n    json: {\n      ...source,\n      hardFail: true,\n      hardFailReason: 'Calendar is disconnected for this salon'\n    }\n  }];\n}\n\nconst durationMinutes = Number(source.durationMinutes);\nconst bufferMinutes = Number(source.bufferMinutes ?? 0);\nconst [y, m, d] = source.requestedDate.split('-').map(Number);\nconst [hh, mm] = source.requestedTime.split(':').map(Number);\n\nconst localRequested = new Date(Date.UTC(y, m - 1, d, hh, mm));\nconst slotStart = localRequested.toISOString();\nconst slotEnd = new Date(localRequested.getTime() + durationMinutes * 60 * 1000).toISOString();\n\nconst dayStartLocal = new Date(Date.UTC(y, m - 1, d, 9, 0));\nconst dayEndLocal = new Date(Date.UTC(y, m - 1, d, 18, 0));\n\nreturn [{\n  json: {\n    ...source,\n    durationMinutes,\n    bufferMinutes,\n    timezone: source.timezone,\n    slotStart,\n    slotEnd,\n    dayStart: dayStartLocal.toISOString(),\n    dayEnd: dayEndLocal.toISOString(),\n    hardFail: false\n  }\n}];"
+        }
+      },
+      {
+        "id": "7",
+        "name": "IF Hard Fail?",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2,
+        "position": [
+          1460,
+          220
+        ],
+        "parameters": {
+          "conditions": {
+            "boolean": [
+              {
+                "value1": "={{$json.hardFail}}",
+                "operation": "true"
+              }
+            ]
+          }
+        }
+      },
+      {
+        "id": "8",
+        "name": "Respond Calendar Disconnected",
+        "type": "n8n-nodes-base.respondToWebhook",
+        "typeVersion": 1,
+        "position": [
+          1700,
+          380
+        ],
+        "parameters": {
+          "respondWith": "json",
+          "responseBody": "={{ { error: $json.hardFailReason, available: false } }}",
+          "options": {
+            "responseCode": 503
+          }
+        }
+      },
+      {
+        "id": "9",
+        "name": "Google Freebusy Query",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          1700,
+          140
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "https://www.googleapis.com/calendar/v3/freeBusy",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "googleOAuth2Api",
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ { timeMin: $json.dayStart, timeMax: $json.dayEnd, items: [{ id: $json.calendarId }] } }}",
+          "options": {}
+        },
+        "credentials": {
+          "googleOAuth2Api": {
+            "id": "REPLACE_GOOGLE_OAUTH2_CREDENTIAL_ID",
+            "name": "BeautyDesk Google OAuth2"
+          }
+        }
+      },
+      {
+        "id": "10",
+        "name": "Evaluate Availability",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          1940,
+          140
+        ],
+        "parameters": {
+          "jsCode": "const input = $json;\nconst calendarKey = input.calendarId;\nconst busy = input.calendars?.[calendarKey]?.busy ?? [];\n\nconst slotStartMs = new Date(input.slotStart).getTime();\nconst slotEndMs = new Date(input.slotEnd).getTime();\nconst bufferEndMs = slotEndMs + (Number(input.bufferMinutes) * 60 * 1000);\n\nconst overlaps = busy.filter((b) => {\n  const bStart = new Date(b.start).getTime();\n  const bEnd = new Date(b.end).getTime();\n  return bStart < bufferEndMs && bEnd > slotStartMs;\n});\n\nconst available = overlaps.length === 0;\nconst suggestions = [];\n\nif (!available) {\n  const incrementMs = 15 * 60 * 1000;\n  const requiredMs = (Number(input.durationMinutes) + Number(input.bufferMinutes)) * 60 * 1000;\n  const dayStartMs = new Date(input.dayStart).getTime();\n  const dayEndMs = new Date(input.dayEnd).getTime();\n\n  for (let probe = dayStartMs; probe + requiredMs <= dayEndMs && suggestions.length < 3; probe += incrementMs) {\n    const probeEnd = probe + requiredMs;\n    const blocked = busy.some((b) => {\n      const bStart = new Date(b.start).getTime();\n      const bEnd = new Date(b.end).getTime();\n      return bStart < probeEnd && bEnd > probe;\n    });\n\n    if (!blocked) {\n      const startIso = new Date(probe).toISOString();\n      const endIso = new Date(probe + Number(input.durationMinutes) * 60 * 1000).toISOString();\n      suggestions.push({ start: startIso, end: endIso });\n    }\n  }\n}\n\nreturn [{\n  json: {\n    ...input,\n    available,\n    overlaps,\n    suggestedSlots: suggestions\n  }\n}];"
+        }
+      },
+      {
+        "id": "11",
+        "name": "IF Available?",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2,
+        "position": [
+          2180,
+          140
+        ],
+        "parameters": {
+          "conditions": {
+            "boolean": [
+              {
+                "value1": "={{$json.available}}",
+                "operation": "true"
+              }
+            ]
+          }
+        }
+      },
+      {
+        "id": "12",
+        "name": "Create Pending Hold Event",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          2420,
+          40
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "={{`https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent($json.calendarId)}/events`}}",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "googleOAuth2Api",
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ { summary: `Pending hold - ${$json.customerName || 'Customer'}`, start: { dateTime: $json.slotStart }, end: { dateTime: $json.slotEnd }, extendedProperties: { private: { type: 'pending_hold', expiresAt: new Date(Date.now() + 10 * 60 * 1000).toISOString(), salonId: String($json.salonId) } } } }}",
+          "options": {}
+        },
+        "credentials": {
+          "googleOAuth2Api": {
+            "id": "REPLACE_GOOGLE_OAUTH2_CREDENTIAL_ID",
+            "name": "BeautyDesk Google OAuth2"
+          }
+        }
+      },
+      {
+        "id": "13",
+        "name": "Respond Available",
+        "type": "n8n-nodes-base.respondToWebhook",
+        "typeVersion": 1,
+        "position": [
+          2660,
+          40
+        ],
+        "parameters": {
+          "respondWith": "json",
+          "responseBody": "={{ { available: true, slot: { start: $json.slotStart, end: $json.slotEnd }, holdEventId: $json.id } }}",
+          "options": {
+            "responseCode": 200
+          }
+        }
+      },
+      {
+        "id": "14",
+        "name": "Respond Unavailable",
+        "type": "n8n-nodes-base.respondToWebhook",
+        "typeVersion": 1,
+        "position": [
+          2420,
+          260
+        ],
+        "parameters": {
+          "respondWith": "json",
+          "responseBody": "={{ { available: false, suggestedSlots: $json.suggestedSlots || [] } }}",
+          "options": {
+            "responseCode": 200
+          }
+        }
+      }
+    ],
+    "connections": {
+      "Webhook": {
+        "main": [
+          [
+            {
+              "node": "Validate Input",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Validate Input": {
+        "main": [
+          [
+            {
+              "node": "IF Valid?",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "IF Valid?": {
+        "main": [
+          [
+            {
+              "node": "Resolve Salon Config",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Respond 400",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Resolve Salon Config": {
+        "main": [
+          [
+            {
+              "node": "Compute Requested Window",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Compute Requested Window": {
+        "main": [
+          [
+            {
+              "node": "IF Hard Fail?",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "IF Hard Fail?": {
+        "main": [
+          [
+            {
+              "node": "Respond Calendar Disconnected",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Google Freebusy Query",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Google Freebusy Query": {
+        "main": [
+          [
+            {
+              "node": "Evaluate Availability",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Evaluate Availability": {
+        "main": [
+          [
+            {
+              "node": "IF Available?",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "IF Available?": {
+        "main": [
+          [
+            {
+              "node": "Create Pending Hold Event",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Respond Unavailable",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Create Pending Hold Event": {
+        "main": [
+          [
+            {
+              "node": "Respond Available",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      }
+    },
+    "pinData": {},
+    "meta": {
+      "templateCredsSetupCompleted": false
+    },
+    "tags": []
+  },
+  {
+    "name": "BeautyDesk - Expired Hold Cleanup",
+    "active": false,
+    "settings": {
+      "executionOrder": "v1",
+      "saveDataErrorExecution": "all",
+      "saveDataSuccessExecution": "none",
+      "saveManualExecutions": true
+    },
+    "nodes": [
+      {
+        "id": "1",
+        "name": "Schedule Trigger",
+        "type": "n8n-nodes-base.scheduleTrigger",
+        "typeVersion": 1.2,
+        "position": [
+          220,
+          300
+        ],
+        "parameters": {
+          "rule": {
+            "interval": [
+              {
+                "field": "minutes",
+                "minutesInterval": 5
+              }
+            ]
+          }
+        }
+      },
+      {
+        "id": "2",
+        "name": "Fetch All Salons",
+        "type": "n8n-nodes-base.postgres",
+        "typeVersion": 2.6,
+        "position": [
+          460,
+          300
+        ],
+        "parameters": {
+          "operation": "executeQuery",
+          "query": "SELECT salon_id, google_calendar_id AS \"calendarId\", timezone\nFROM salon_config\nWHERE google_calendar_id IS NOT NULL;"
+        },
+        "credentials": {
+          "postgres": {
+            "id": "REPLACE_POSTGRES_CREDENTIAL_ID",
+            "name": "BeautyDesk Postgres"
+          }
+        }
+      },
+      {
+        "id": "3",
+        "name": "Split In Batches",
+        "type": "n8n-nodes-base.splitInBatches",
+        "typeVersion": 3,
+        "position": [
+          700,
+          300
+        ],
+        "parameters": {
+          "batchSize": 1
+        }
+      },
+      {
+        "id": "4",
+        "name": "List Pending Holds",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          940,
+          220
+        ],
+        "parameters": {
+          "method": "GET",
+          "url": "={{`https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent($json.calendarId)}/events`}}",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "googleOAuth2Api",
+          "sendQuery": true,
+          "queryParameters": {
+            "parameters": [
+              {
+                "name": "privateExtendedProperty",
+                "value": "type=pending_hold"
+              },
+              {
+                "name": "singleEvents",
+                "value": "true"
+              },
+              {
+                "name": "timeMin",
+                "value": "={{ new Date(Date.now() - 60 * 60 * 1000).toISOString() }}"
+              },
+              {
+                "name": "timeMax",
+                "value": "={{ new Date(Date.now() + 60 * 60 * 1000).toISOString() }}"
+              },
+              {
+                "name": "maxResults",
+                "value": "250"
+              }
+            ]
+          }
+        },
+        "credentials": {
+          "googleOAuth2Api": {
+            "id": "REPLACE_GOOGLE_OAUTH2_CREDENTIAL_ID",
+            "name": "BeautyDesk Google OAuth2"
+          }
+        }
+      },
+      {
+        "id": "5",
+        "name": "Filter Expired Holds",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          1180,
+          220
+        ],
+        "parameters": {
+          "jsCode": "const now = Date.now();\nconst salon = $('Split In Batches').item.json;\nconst events = $json.items || [];\n\nconst expired = events\n  .filter((evt) => {\n    const expiresAt = evt?.extendedProperties?.private?.expiresAt;\n    if (!expiresAt) return false;\n    const ts = new Date(expiresAt).getTime();\n    return !Number.isNaN(ts) && ts < now;\n  })\n  .map((evt) => ({\n    json: {\n      salonId: salon.salon_id || salon.salonId,\n      calendarId: salon.calendarId,\n      eventId: evt.id\n    }\n  }));\n\nreturn expired;"
+        }
+      },
+      {
+        "id": "6",
+        "name": "Delete Expired Hold",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          1420,
+          220
+        ],
+        "parameters": {
+          "method": "DELETE",
+          "url": "={{`https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent($json.calendarId)}/events/${encodeURIComponent($json.eventId)}`}}",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "googleOAuth2Api",
+          "options": {
+            "ignoreResponseCode": true
+          }
+        },
+        "credentials": {
+          "googleOAuth2Api": {
+            "id": "REPLACE_GOOGLE_OAUTH2_CREDENTIAL_ID",
+            "name": "BeautyDesk Google OAuth2"
+          }
+        }
+      },
+      {
+        "id": "7",
+        "name": "Next Batch",
+        "type": "n8n-nodes-base.noOp",
+        "typeVersion": 1,
+        "position": [
+          1660,
+          220
+        ],
+        "parameters": {}
+      },
+      {
+        "id": "8",
+        "name": "Log Summary",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          940,
+          420
+        ],
+        "parameters": {
+          "jsCode": "return [{ json: { status: 'cleanup_complete', completedAt: new Date().toISOString() } }];"
+        }
+      }
+    ],
+    "connections": {
+      "Schedule Trigger": {
+        "main": [
+          [
+            {
+              "node": "Fetch All Salons",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Fetch All Salons": {
+        "main": [
+          [
+            {
+              "node": "Split In Batches",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Split In Batches": {
+        "main": [
+          [
+            {
+              "node": "List Pending Holds",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Log Summary",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "List Pending Holds": {
+        "main": [
+          [
+            {
+              "node": "Filter Expired Holds",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Filter Expired Holds": {
+        "main": [
+          [
+            {
+              "node": "Delete Expired Hold",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Delete Expired Hold": {
+        "main": [
+          [
+            {
+              "node": "Next Batch",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Next Batch": {
+        "main": [
+          [
+            {
+              "node": "Split In Batches",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      }
+    },
+    "pinData": {},
+    "meta": {
+      "templateCredsSetupCompleted": false
+    },
+    "tags": []
+  },
+  {
+    "name": "BeautyDesk - OAuth2 Token Failure Alert",
+    "active": false,
+    "settings": {
+      "executionOrder": "v1",
+      "saveDataErrorExecution": "all",
+      "saveDataSuccessExecution": "none",
+      "saveManualExecutions": true
+    },
+    "nodes": [
+      {
+        "id": "1",
+        "name": "Error Trigger",
+        "type": "n8n-nodes-base.errorTrigger",
+        "typeVersion": 1,
+        "position": [
+          220,
+          320
+        ],
+        "parameters": {}
+      },
+      {
+        "id": "2",
+        "name": "Classify Error",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          460,
+          320
+        ],
+        "parameters": {
+          "jsCode": "const err = $json.error || {};\nconst raw = JSON.stringify(err).toLowerCase();\nconst isAuthFailure =\n  raw.includes('invalid_grant') ||\n  raw.includes('unauthorized_client') ||\n  raw.includes('token expired') ||\n  raw.includes('401') ||\n  raw.includes('403');\n\nreturn [{\n  json: {\n    ...$json,\n    isAuthFailure,\n    errorType: isAuthFailure ? 'google_oauth_failure' : 'non_auth_error'\n  }\n}];"
+        }
+      },
+      {
+        "id": "3",
+        "name": "IF Auth Failure?",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2,
+        "position": [
+          700,
+          320
+        ],
+        "parameters": {
+          "conditions": {
+            "boolean": [
+              {
+                "value1": "={{$json.isAuthFailure}}",
+                "operation": "true"
+              }
+            ]
+          }
+        }
+      },
+      {
+        "id": "4",
+        "name": "Identify Affected Salon",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          940,
+          220
+        ],
+        "parameters": {
+          "jsCode": "const execution = $json.execution || {};\nconst inputData = execution.lastNodeExecuted ? execution.data?.resultData?.runData?.[execution.lastNodeExecuted]?.[0]?.data?.main?.[0]?.[0]?.json || {} : {};\n\nreturn [{\n  json: {\n    ...$json,\n    salonId: inputData.salonId || inputData.salon_id || null,\n    calendarId: inputData.calendarId || inputData.googleCalendarId || null\n  }\n}];"
+        }
+      },
+      {
+        "id": "5",
+        "name": "Check Alert Throttle",
+        "type": "n8n-nodes-base.postgres",
+        "typeVersion": 2.6,
+        "position": [
+          1180,
+          220
+        ],
+        "parameters": {
+          "operation": "executeQuery",
+          "query": "SELECT COUNT(*)::int AS recent_count\nFROM alert_log\nWHERE salon_id = $1\n  AND error_type = 'google_oauth_failure'\n  AND created_at >= NOW() - INTERVAL '24 hours';",
+          "options": {
+            "queryReplacement": "={{[$json.salonId]}}"
+          }
+        },
+        "credentials": {
+          "postgres": {
+            "id": "REPLACE_POSTGRES_CREDENTIAL_ID",
+            "name": "BeautyDesk Postgres"
+          }
+        }
+      },
+      {
+        "id": "6",
+        "name": "IF Already Alerted?",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2,
+        "position": [
+          1420,
+          220
+        ],
+        "parameters": {
+          "conditions": {
+            "number": [
+              {
+                "value1": "={{$json.recent_count || 0}}",
+                "operation": "larger",
+                "value2": 0
+              }
+            ]
+          }
+        }
+      },
+      {
+        "id": "7",
+        "name": "Log Alert",
+        "type": "n8n-nodes-base.postgres",
+        "typeVersion": 2.6,
+        "position": [
+          1660,
+          140
+        ],
+        "parameters": {
+          "operation": "executeQuery",
+          "query": "INSERT INTO alert_log (salon_id, error_type, created_at, calendar_id)\nVALUES ($1, $2, NOW(), $3);",
+          "options": {
+            "queryReplacement": "={{[$json.salonId, $json.errorType, $json.calendarId]}}"
+          }
+        },
+        "credentials": {
+          "postgres": {
+            "id": "REPLACE_POSTGRES_CREDENTIAL_ID",
+            "name": "BeautyDesk Postgres"
+          }
+        }
+      },
+      {
+        "id": "8",
+        "name": "Notify Salon + Ops",
+        "type": "n8n-nodes-base.emailSend",
+        "typeVersion": 2.1,
+        "position": [
+          1900,
+          140
+        ],
+        "parameters": {
+          "fromEmail": "ops@beautydesk.example",
+          "toEmail": "={{$json.salonContactEmail || 'ops@beautydesk.example'}}",
+          "subject": "Action required: reconnect your BeautyDesk calendar",
+          "text": "Your Google Calendar connection needs to be re-authorized for BeautyDesk. Please reconnect in the admin portal.\n\nSalon ID: {{$json.salonId}}\nCalendar ID: {{$json.calendarId}}"
+        },
+        "credentials": {
+          "smtp": {
+            "id": "REPLACE_SMTP_CREDENTIAL_ID",
+            "name": "BeautyDesk SMTP"
+          }
+        }
+      },
+      {
+        "id": "9",
+        "name": "Mark Salon Disconnected",
+        "type": "n8n-nodes-base.postgres",
+        "typeVersion": 2.6,
+        "position": [
+          2140,
+          140
+        ],
+        "parameters": {
+          "operation": "executeQuery",
+          "query": "UPDATE salon_config\nSET calendar_status = 'disconnected', updated_at = NOW()\nWHERE salon_id = $1;",
+          "options": {
+            "queryReplacement": "={{[$json.salonId]}}"
+          }
+        },
+        "credentials": {
+          "postgres": {
+            "id": "REPLACE_POSTGRES_CREDENTIAL_ID",
+            "name": "BeautyDesk Postgres"
+          }
+        }
+      },
+      {
+        "id": "10",
+        "name": "No-op (Already Alerted)",
+        "type": "n8n-nodes-base.noOp",
+        "typeVersion": 1,
+        "position": [
+          1660,
+          320
+        ],
+        "parameters": {}
+      },
+      {
+        "id": "11",
+        "name": "No-op (Non Auth Error)",
+        "type": "n8n-nodes-base.noOp",
+        "typeVersion": 1,
+        "position": [
+          940,
+          420
+        ],
+        "parameters": {}
+      }
+    ],
+    "connections": {
+      "Error Trigger": {
+        "main": [
+          [
+            {
+              "node": "Classify Error",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Classify Error": {
+        "main": [
+          [
+            {
+              "node": "IF Auth Failure?",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "IF Auth Failure?": {
+        "main": [
+          [
+            {
+              "node": "Identify Affected Salon",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "No-op (Non Auth Error)",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Identify Affected Salon": {
+        "main": [
+          [
+            {
+              "node": "Check Alert Throttle",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Check Alert Throttle": {
+        "main": [
+          [
+            {
+              "node": "IF Already Alerted?",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "IF Already Alerted?": {
+        "main": [
+          [
+            {
+              "node": "No-op (Already Alerted)",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Log Alert",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Log Alert": {
+        "main": [
+          [
+            {
+              "node": "Notify Salon + Ops",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Notify Salon + Ops": {
+        "main": [
+          [
+            {
+              "node": "Mark Salon Disconnected",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      }
+    },
+    "pinData": {},
+    "meta": {
+      "templateCredsSetupCompleted": false
+    },
+    "tags": []
+  }
+]
